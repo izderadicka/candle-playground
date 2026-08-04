@@ -1,0 +1,14 @@
+[package]
+name = "candle-playground"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+candle-core = { version = "0.11.0", path = "../candle/candle-core" }
+candle-datasets = { version = "0.11.0", path = "../candle/candle-datasets" }
+candle-nn = { version = "0.11.0", path = "../candle/candle-nn" }
+clap = { version = "4.6.4", features = ["derive"] }
+itertools = "0.15.0"
+rand = "0.10.2"
+tqdm = "0.8.0"
