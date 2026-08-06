@@ -1,3 +1,4 @@
 {
-    "editor.formatOnSave": true
+    "editor.formatOnSave": true,
+    "editor.inlineSuggest.experimental.suppressInlineSuggestions": "github.copilot-chat"
 }

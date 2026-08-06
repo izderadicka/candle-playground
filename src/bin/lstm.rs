@@ -1,8 +1,92 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
-use candle_core::{Device, Tensor};
-use rand::{RngExt, SeedableRng, rngs::StdRng, seq::SliceRandom};
+use candle_core::{DType, Device, Tensor};
+use candle_nn::{
+    AdamW, LSTM, LSTMConfig, Linear, Module, Optimizer, RNN, VarBuilder, VarMap, linear,
+    loss::cross_entropy, lstm,
+};
+use candle_playground::Timer;
+use rand::{RngExt, seq::SliceRandom};
+
+pub struct Model {
+    lstm: LSTM,
+    linear: Linear,
+}
+
+impl Model {
+    pub fn new(vb: VarBuilder, vocab_size: usize) -> Result<Self> {
+        let cfg = LSTMConfig::default();
+        let lstm = lstm(vocab_size, 256, cfg, vb.pp("lstm"))?;
+        let linear = linear(256, vocab_size, vb.pp("linear"))?;
+        Ok(Self { lstm, linear })
+    }
+}
+
+impl Module for Model {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let states = self.lstm.seq(x)?;
+        let h = self.lstm.states_to_tensor(&states)?;
+        self.linear.forward(&h)
+    }
+}
+
+struct TrainingConfig {
+    epochs: usize,
+    output_file: Option<PathBuf>,
+    vocab_size: usize,
+    window_size: usize,
+    batch_size: usize,
+    learning_rate: f64,
+}
+
+fn train(
+    indices: &[u8],
+    config: TrainingConfig,
+    dev: &Device,
+    rng: &mut impl RngExt,
+) -> Result<Model> {
+    let mut var_map = VarMap::new();
+    let vb = VarBuilder::from_varmap(&var_map, DType::F32, dev);
+    let model = Model::new(vb, config.vocab_size)?;
+    let mut optimizer = AdamW::new_lr(var_map.all_vars(), config.learning_rate)?;
+    let epochs = config.epochs;
+    println!("");
+    for epoch in 0..epochs {
+        let epoch_timer = Timer::new();
+        let mut epoch_loss = 0.0;
+        let batches = generate_batches(indices, config.window_size, config.batch_size, rng)?;
+        let num_batches = batches.len();
+        for (batch_idx, batch) in batches.iter().enumerate() {
+            let (inputs, targets) = batch_data(&batch, config.vocab_size, dev)?;
+            let logits = model.forward(&inputs)?;
+            let (b, s, v) = logits.dims3()?;
+            let loss = cross_entropy(&logits.reshape((b * s, v))?, &targets)?;
+            optimizer.backward_step(&loss)?;
+            let batch_loss = loss.to_scalar::<f32>()?;
+            epoch_loss += batch_loss;
+            print!("Epoch {epoch}; Batch {batch_idx}/{num_batches}; Loss {batch_loss:.6};\r");
+            std::io::stdout().flush()?;
+        }
+        let epoch_loss = epoch_loss / num_batches as f32;
+        println!(
+            "\n Epoch {epoch}/{epochs}; Epoch Loss {epoch_loss:.6}; Took {:.3}",
+            epoch_timer.elapsed()
+        )
+    }
+
+    if let Some(file) = config.output_file {
+        if let Err(e) = var_map.save(file) {
+            eprint!("Error saving model: {e}")
+        }
+    }
+
+    Ok(model)
+}
 
 fn read_text(file: &Path) -> anyhow::Result<String> {
     std::fs::read_to_string(file).map_err(anyhow::Error::from)
@@ -36,51 +120,16 @@ fn indices_to_chars(char_counts: &HashMap<char, usize>) -> HashMap<u8, char> {
     index_to_char
 }
 
-fn byte_to_vector(byte: u8, vocab_size: usize) -> Vec<f32> {
-    let mut vec = vec![0.0; vocab_size];
-    vec[byte as usize] = 1.0;
-    vec
-}
-
-fn char_to_vector(c: char, char_to_index: &HashMap<char, u8>, vocab_size: usize) -> Vec<f32> {
-    let index = char_to_index.get(&c).unwrap();
-    byte_to_vector(*index, vocab_size)
-}
-
-fn text_to_vectors(
-    text: &str,
-    char_to_index: &HashMap<char, u8>,
-    vocab_size: usize,
-) -> Vec<Vec<f32>> {
-    text.chars()
-        .map(|c| char_to_vector(c, char_to_index, vocab_size))
-        .collect()
-}
-
-fn top_k_chars(char_counts: &HashMap<char, usize>, k: usize) -> Vec<(char, usize)> {
-    let mut char_counts_vec: Vec<(char, usize)> =
-        char_counts.iter().map(|(&c, &count)| (c, count)).collect();
-    char_counts_vec.sort_by(|a, b| b.1.cmp(&a.1));
-    char_counts_vec.truncate(k);
-    char_counts_vec
-}
-
-fn bottom_k_chars(char_counts: &HashMap<char, usize>, k: usize) -> Vec<(char, usize)> {
-    let mut char_counts_vec: Vec<(char, usize)> =
-        char_counts.iter().map(|(&c, &count)| (c, count)).collect();
-    char_counts_vec.sort_by(|a, b| a.1.cmp(&b.1));
-    char_counts_vec.truncate(k);
-    char_counts_vec
-}
-
 const WINDOW_SIZE: usize = 100;
+
+type Batches = Vec<Vec<Vec<u8>>>;
 
 fn generate_batches(
     indices: &[u8],
     window_size: usize,
     batch_size: usize,
-    rng: &mut StdRng,
-) -> Result<Vec<Vec<Vec<u8>>>> {
+    rng: &mut impl RngExt,
+) -> Result<Batches> {
     let start = rng.random_range(0..WINDOW_SIZE);
     let mut window_starts: Vec<usize> = (start..indices.len() - WINDOW_SIZE)
         .step_by(WINDOW_SIZE)
@@ -99,43 +148,53 @@ fn generate_batches(
     Ok(batches)
 }
 
-fn window_to_input(window: &[u8], vocab_size: usize) -> Result<(Vec<Vec<f32>>, u8)> {
-    let input = window[..window.len() - 1]
-        .into_iter()
-        .map(|&b| byte_to_vector(b, vocab_size))
-        .collect::<Vec<_>>();
-    let target = *window.last().unwrap();
-    Ok((input, target))
-}
-
-fn batch_data(batch: Vec<Vec<u8>>, vocab_size: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
+fn batch_data(batch: &[Vec<u8>], vocab_size: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
     let batch_size = batch.len();
-    let mut inputs = Vec::with_capacity(batch_size);
+    let seq_len = batch[0].len() - 1;
+    let mut inputs = vec![0f32; batch_size * seq_len * vocab_size]; // one allocation
     let mut targets = Vec::with_capacity(batch_size);
 
-    for window in batch {
-        let (input, target) = window_to_input(&window, vocab_size)?;
-        inputs.push(input);
-        targets.push(target);
+    for (b, window) in batch.iter().enumerate() {
+        for (t, &idx) in window[..seq_len].iter().enumerate() {
+            inputs[(b * seq_len + t) * vocab_size + idx as usize] = 1.0; // set one element
+        }
+        for target in window[1..].iter() {
+            targets.push(*target as u32);
+        }
     }
-    let input_tensor = Tensor::from_vec(inputs, (), dev)?;
-    let target_tensor = Tensor::from_vec(targets, (batch_size,), dev)?;
+
+    let input_tensor = Tensor::from_vec(inputs, (batch_size, seq_len, vocab_size), dev)?;
+    let target_tensor =
+        Tensor::from_vec(targets, (batch_size * seq_len,), dev)?.to_dtype(DType::U32)?;
     Ok((input_tensor, target_tensor))
 }
 
+const VOCAB_SIZE: usize = 112;
+
 fn main() -> anyhow::Result<()> {
+    let dev = Device::Cpu;
     let corpus = read_text(Path::new("data/capek.txt"))?;
     let char_counts = collect_chars(&corpus);
+    let vocab_size = char_counts.len();
     print!("Corpus length: {}\n", corpus.len());
     print!("Unique characters: {}\n", char_counts.len());
     let chars_map = chars_to_indices(&char_counts);
     let indices_map = indices_to_chars(&char_counts);
-    let top_k = top_k_chars(&char_counts, 10);
-    let corpus = corpus
+    let mut rng = rand::rng();
+    let corpus_indexed: Vec<u8> = corpus
         .chars()
-        .map(|c| chars_map.get(&c).unwrap().to_owned())
-        .collect::<Vec<u8>>();
-    let mut rng = StdRng::seed_from_u64(42);
+        .map(|c| *chars_map.get(&c).unwrap()) // can unwrap as map is done from same data
+        .collect();
 
+    let training_config = TrainingConfig {
+        epochs: 20,
+        output_file: Some(PathBuf::from("output/lstm.safetensors")),
+        vocab_size,
+        window_size: 100,
+        batch_size: 64,
+        learning_rate: 0.001,
+    };
+
+    let model = train(&corpus_indexed, training_config, &dev, &mut rng)?;
     Ok(())
 }
