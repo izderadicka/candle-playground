@@ -1,19 +1,20 @@
-use std::{
-    collections::HashMap,
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{io::Write, path::PathBuf};
 
 use anyhow::Result;
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{
-    AdamW, LSTM, LSTMConfig, Linear, Module, Optimizer, RNN, VarBuilder, VarMap, linear,
-    loss::cross_entropy, lstm,
+    AdamW, Embedding, LSTM, LSTMConfig, Linear, Module, Optimizer, RNN, VarBuilder, VarMap,
+    embedding, linear, loss::cross_entropy, lstm,
 };
-use candle_playground::Timer;
-use rand::{RngExt, seq::SliceRandom};
+use candle_playground::{
+    Timer,
+    text::{Corpus, batch_data, generate_batches},
+};
+use clap::{Parser, Subcommand};
+use rand::RngExt;
 
 pub struct Model {
+    embed: Embedding,
     lstm: LSTM,
     linear: Linear,
 }
@@ -21,15 +22,21 @@ pub struct Model {
 impl Model {
     pub fn new(vb: VarBuilder, vocab_size: usize) -> Result<Self> {
         let cfg = LSTMConfig::default();
-        let lstm = lstm(vocab_size, 256, cfg, vb.pp("lstm"))?;
+        let embed = embedding(vocab_size, 64, vb.pp("embed"))?;
+        let lstm = lstm(64, 256, cfg, vb.pp("lstm"))?;
         let linear = linear(256, vocab_size, vb.pp("linear"))?;
-        Ok(Self { lstm, linear })
+        Ok(Self {
+            embed,
+            lstm,
+            linear,
+        })
     }
 }
 
 impl Module for Model {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let states = self.lstm.seq(x)?;
+        let e = self.embed.forward(&x)?;
+        let states = self.lstm.seq(&e)?;
         let h = self.lstm.states_to_tensor(&states)?;
         self.linear.forward(&h)
     }
@@ -50,7 +57,7 @@ fn train(
     dev: &Device,
     rng: &mut impl RngExt,
 ) -> Result<Model> {
-    let mut var_map = VarMap::new();
+    let var_map = VarMap::new();
     let vb = VarBuilder::from_varmap(&var_map, DType::F32, dev);
     let model = Model::new(vb, config.vocab_size)?;
     let mut optimizer = AdamW::new_lr(var_map.all_vars(), config.learning_rate)?;
@@ -88,113 +95,122 @@ fn train(
     Ok(model)
 }
 
-fn read_text(file: &Path) -> anyhow::Result<String> {
-    std::fs::read_to_string(file).map_err(anyhow::Error::from)
-}
-
-fn collect_chars(text: &str) -> HashMap<char, usize> {
-    let mut char_counts = HashMap::new();
-    for c in text.chars() {
-        *char_counts.entry(c).or_insert(0) += 1;
-    }
-    char_counts
-}
-
-fn chars_to_indices(char_counts: &HashMap<char, usize>) -> HashMap<char, u8> {
-    let mut chars: Vec<char> = char_counts.keys().cloned().collect();
-    chars.sort();
-    let mut char_to_index = HashMap::new();
-    for (i, c) in chars.iter().enumerate() {
-        char_to_index.insert(*c, i.try_into().unwrap());
-    }
-    char_to_index
-}
-
-fn indices_to_chars(char_counts: &HashMap<char, usize>) -> HashMap<u8, char> {
-    let mut chars: Vec<char> = char_counts.keys().cloned().collect();
-    chars.sort();
-    let mut index_to_char = HashMap::new();
-    for (i, c) in chars.iter().enumerate() {
-        index_to_char.insert(i.try_into().unwrap(), *c);
-    }
-    index_to_char
-}
-
 const WINDOW_SIZE: usize = 100;
 
-type Batches = Vec<Vec<Vec<u8>>>;
-
-fn generate_batches(
-    indices: &[u8],
-    window_size: usize,
-    batch_size: usize,
+fn sample(
+    model: &Model,
+    seed: &str,
+    n: usize,
+    temp: f64,
+    corpus: &Corpus,
+    dev: &Device,
     rng: &mut impl RngExt,
-) -> Result<Batches> {
-    let start = rng.random_range(0..WINDOW_SIZE);
-    let mut window_starts: Vec<usize> = (start..indices.len() - WINDOW_SIZE)
-        .step_by(WINDOW_SIZE)
-        .collect();
-    window_starts.shuffle(rng);
-    let windows = window_starts
-        .into_iter()
-        .map(|start| &indices[start..start + window_size + 1])
-        .map(Vec::from)
-        .collect::<Vec<_>>();
-    let batches = windows
-        .chunks(batch_size)
-        .map(Vec::from)
-        .collect::<Vec<_>>();
+) -> Result<String> {
+    let mut ctx: Vec<u32> = seed
+        .chars()
+        .map(|c| corpus.char_to_index(c))
+        .map(|r| r.map(|i| i as u32))
+        .collect::<Result<Vec<_>>>()?;
+    let mut out = String::from(seed);
 
-    Ok(batches)
-}
+    for _ in 0..n {
+        // one-hot the current context
+        let seq_len = ctx.len();
 
-fn batch_data(batch: &[Vec<u8>], vocab_size: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
-    let batch_size = batch.len();
-    let seq_len = batch[0].len() - 1;
-    let mut inputs = vec![0f32; batch_size * seq_len * vocab_size]; // one allocation
-    let mut targets = Vec::with_capacity(batch_size);
+        let input = Tensor::from_slice(&ctx, (1, seq_len), dev)?;
 
-    for (b, window) in batch.iter().enumerate() {
-        for (t, &idx) in window[..seq_len].iter().enumerate() {
-            inputs[(b * seq_len + t) * vocab_size + idx as usize] = 1.0; // set one element
+        let logits = model.forward(&input)?; // [1, seq_len, vocab]
+        let last = logits.i((0, seq_len - 1))?; // [vocab]
+        let probs = candle_nn::ops::softmax(&(last / temp)?, 0)?.to_vec1::<f32>()?;
+
+        // sample from the distribution
+        let r: f32 = rng.random();
+        let mut acc = 0.0;
+        let mut pick = 0u8;
+        for (i, p) in probs.iter().enumerate() {
+            acc += p;
+            if acc >= r {
+                pick = i as u8;
+                break;
+            }
         }
-        for target in window[1..].iter() {
-            targets.push(*target as u32);
-        }
+
+        out.push(corpus.index_to_char(pick)?);
+        ctx.push(pick as u32);
+        if ctx.len() > 100 {
+            ctx.remove(0);
+        } // keep context bounded
     }
-
-    let input_tensor = Tensor::from_vec(inputs, (batch_size, seq_len, vocab_size), dev)?;
-    let target_tensor =
-        Tensor::from_vec(targets, (batch_size * seq_len,), dev)?.to_dtype(DType::U32)?;
-    Ok((input_tensor, target_tensor))
+    Ok(out)
 }
 
-const VOCAB_SIZE: usize = 112;
+#[derive(Parser)]
+struct Cli {
+    /// Model file
+    #[arg(
+        short,
+        long,
+        default_value = "output/lstm.safetensors",
+        help = "model parameters file"
+    )]
+    file: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Train the model and save it to the model file
+    Train {
+        #[arg(short, long, default_value = "32", help = "number of epochs")]
+        epochs: usize,
+    },
+    /// Sample text from a trained model
+    Sample {
+        #[arg(short, long, help = "Context to start with")]
+        context: String,
+        #[arg(short, long, help = "Number of characters to generate")]
+        size: usize,
+        #[arg(short, long, default_value = "1.0", help = "Temperature")]
+        temp: f64,
+    },
+}
 
 fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
     let dev = Device::Cpu;
-    let corpus = read_text(Path::new("data/capek.txt"))?;
-    let char_counts = collect_chars(&corpus);
-    let vocab_size = char_counts.len();
-    print!("Corpus length: {}\n", corpus.len());
-    print!("Unique characters: {}\n", char_counts.len());
-    let chars_map = chars_to_indices(&char_counts);
-    let indices_map = indices_to_chars(&char_counts);
     let mut rng = rand::rng();
-    let corpus_indexed: Vec<u8> = corpus
-        .chars()
-        .map(|c| *chars_map.get(&c).unwrap()) // can unwrap as map is done from same data
-        .collect();
+    let corpus = Corpus::from_text_file("data/capek.txt")?;
+    let vocab_size = corpus.vocab_size();
 
-    let training_config = TrainingConfig {
-        epochs: 20,
-        output_file: Some(PathBuf::from("output/lstm.safetensors")),
-        vocab_size,
-        window_size: 100,
-        batch_size: 64,
-        learning_rate: 0.001,
-    };
+    match cli.command {
+        Command::Train { epochs } => {
+            let corpus_indexed: Vec<u8> = corpus.indexed_corpus();
 
-    let model = train(&corpus_indexed, training_config, &dev, &mut rng)?;
+            let training_config = TrainingConfig {
+                epochs,
+                output_file: Some(cli.file),
+                vocab_size,
+                window_size: 100,
+                batch_size: 64,
+                learning_rate: 0.001,
+            };
+
+            let _model = train(&corpus_indexed, training_config, &dev, &mut rng)?;
+        }
+        Command::Sample {
+            context,
+            size,
+            temp,
+        } => {
+            let mut var_map = VarMap::new();
+            let vb = VarBuilder::from_varmap(&var_map, DType::F32, &dev);
+            let model = Model::new(vb, vocab_size)?;
+            var_map.load(&cli.file)?;
+            let output = sample(&model, &context, size, temp, &corpus, &dev, &mut rng)?;
+            println!("For context: {context} model generated:");
+            println!("{output}");
+        }
+    }
     Ok(())
 }

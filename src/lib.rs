@@ -1,6 +1,8 @@
 use candle_core::{DType, Result, Tensor};
 use candle_nn::ModuleT;
 
+pub mod text;
+
 pub fn test_classification(
     model: &impl ModuleT,
     test_data: Tensor,
