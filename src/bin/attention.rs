@@ -110,6 +110,13 @@ impl MultiHeadAttention {
     }
 }
 
+// LayerNorm::forward dispatches to a fused kernel (ops::layer_norm) that has no backward pass
+// and silently detaches the autograd graph, so gradients never reach layers below the norm.
+// Use the differentiable layer_norm_slow instead.
+fn ln_forward(ln: &LayerNorm, x: &Tensor) -> Result<Tensor> {
+    candle_nn::ops::layer_norm_slow(x, ln.weight(), ln.bias().unwrap(), ln.eps() as f32)
+}
+
 fn causal_mask(seq_len: usize, dev: &Device) -> Result<Tensor> {
     let mut m = vec![0f32; seq_len * seq_len];
     for i in 0..seq_len {
@@ -148,9 +155,9 @@ impl SelfAttentionLayer {
     }
 
     pub fn forward(&self, x: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
-        let h = self.attention.forward(&self.norm1.forward(x)?, mask)?;
+        let h = self.attention.forward(&ln_forward(&self.norm1, x)?, mask)?;
         let x = (x + h)?; // residual path
-        let h = self.ff1.forward(&self.norm2.forward(&x)?)?.relu()?;
+        let h = self.ff1.forward(&ln_forward(&self.norm2, &x)?)?.relu()?;
         let h = self.ff2.forward(&h)?;
         x + h
     }
@@ -251,7 +258,7 @@ impl Model {
             h = layer.forward(&h, mask)?;
         }
 
-        self.output.forward(&self.norm_final.forward(&h)?)
+        self.output.forward(&ln_forward(&self.norm_final, &h)?)
     }
 }
 
