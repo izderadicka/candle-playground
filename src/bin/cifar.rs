@@ -72,7 +72,7 @@ impl Module for Model {
 
 fn train(train_data: Tensor, train_labels: Tensor, epochs: u32, file_name: &str) -> Result<Model> {
     let device = Device::cuda_if_available(0)?;
-    let mut var_map = VarMap::new();
+    let var_map = VarMap::new();
     let vs = VarBuilder::from_varmap(&var_map, DType::F32, &device);
     let model = Model::new(vs)?;
     let learning_rate = 0.001;

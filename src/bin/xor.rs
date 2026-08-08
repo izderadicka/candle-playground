@@ -1,4 +1,4 @@
-use candle_core::{D, DType, Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Linear, Module, Optimizer, VarBuilder, VarMap, loss, ops};
 
 struct Model {
@@ -31,6 +31,7 @@ impl Module for Model {
     }
 }
 
+#[allow(dead_code)]
 fn make_linear(vs: VarBuilder, in_features: usize, out_features: usize) -> Result<Linear> {
     let ws = vs.get_with_hints(
         (out_features, in_features),

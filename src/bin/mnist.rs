@@ -144,7 +144,7 @@ fn main() -> Result<()> {
             let data = candle_datasets::vision::mnist::load()?;
             let _model = train(data, epochs, &args.model_file)?;
         }
-        Command::Infer { image } => {
+        Command::Infer { .. } => {
             let data = candle_datasets::vision::mnist::load()?;
             let dev = Device::cuda_if_available(0)?;
             for index in 0..data.test_images.dim(0)? {

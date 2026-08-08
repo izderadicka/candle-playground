@@ -194,7 +194,6 @@ pub struct Model {
     layers: Vec<SelfAttentionLayer>,
     norm_final: LayerNorm,
     output: Linear,
-    scale: f64,
 }
 
 pub struct ModelConfig {
@@ -235,7 +234,6 @@ impl Model {
             vb.pp("norm_final"),
         )?;
         let output = linear(cfg.hidden_size, cfg.vocab_size, vb.pp("output"))?;
-        let scale = (cfg.hidden_size as f64).sqrt();
 
         Ok(Self {
             embed,
@@ -243,12 +241,11 @@ impl Model {
             layers,
             norm_final,
             output,
-            scale,
         })
     }
 
     pub fn forward(&self, x: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
-        let y = (self.embed.forward(x)? * self.scale)?;
+        let y = self.embed.forward(x)?;
         let mut h = self.pos.forward(&y)?;
         for layer in &self.layers {
             h = layer.forward(&h, mask)?;
@@ -275,7 +272,6 @@ fn train(
 ) -> anyhow::Result<Model> {
     let var_map = VarMap::new();
     let vb = VarBuilder::from_varmap(&var_map, DType::F32, dev);
-    let vocab_size = config.model_cfg.vocab_size;
     let model = Model::new(vb, config.model_cfg, dev)?;
     let mut optimizer = AdamW::new_lr(var_map.all_vars(), config.learning_rate)?;
     let epochs = config.epochs;
@@ -287,7 +283,7 @@ fn train(
         let batches = generate_batches(indices, config.window_size, config.batch_size, rng)?;
         let num_batches = batches.len();
         for (batch_idx, batch) in batches.iter().enumerate() {
-            let (inputs, targets) = batch_data(&batch, vocab_size, dev)?;
+            let (inputs, targets) = batch_data(&batch, dev)?;
             let logits = model.forward(&inputs, Some(&causal_mask))?;
             let (b, s, v) = logits.dims3()?;
             let loss = cross_entropy(&logits.reshape((b * s, v))?, &targets)?;

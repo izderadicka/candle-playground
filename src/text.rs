@@ -30,7 +30,7 @@ pub fn generate_batches(
     Ok(batches)
 }
 
-pub fn batch_data(batch: &[Vec<u8>], vocab_size: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
+pub fn batch_data(batch: &[Vec<u8>], dev: &Device) -> Result<(Tensor, Tensor)> {
     let batch_size = batch.len();
     let seq_len = batch[0].len() - 1;
     let mut inputs = Vec::with_capacity(batch_size * seq_len);

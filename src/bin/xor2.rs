@@ -37,7 +37,8 @@ fn main() -> Result<()> {
         let h2 = z2.relu()?; // (4,8)
         let z3 = h2.matmul(&w3)?.broadcast_add(&b3)?;
         sigmoid(&z3)
-    };
+    }
+
     for epoch in 0..3000 {
         // ---- forward ----
         let z1 = x.matmul(&w1)?.broadcast_add(&b1)?; // (4,8)

@@ -70,7 +70,7 @@ fn train(
         let batches = generate_batches(indices, config.window_size, config.batch_size, rng)?;
         let num_batches = batches.len();
         for (batch_idx, batch) in batches.iter().enumerate() {
-            let (inputs, targets) = batch_data(&batch, config.vocab_size, dev)?;
+            let (inputs, targets) = batch_data(&batch, dev)?;
             let logits = model.forward(&inputs)?;
             let (b, s, v) = logits.dims3()?;
             let loss = cross_entropy(&logits.reshape((b * s, v))?, &targets)?;

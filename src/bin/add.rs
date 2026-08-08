@@ -1,8 +1,6 @@
-use core::error;
-
-use candle_core::{DType, Device, Result, Tensor, Var};
+use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Linear, Module, Optimizer, VarBuilder, VarMap, linear};
-use rand::{Rng, RngExt};
+use rand::RngExt;
 
 struct Model {
     first: Linear,

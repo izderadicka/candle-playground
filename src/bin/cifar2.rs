@@ -1,9 +1,6 @@
-use std::{
-    io::Write as _,
-    path::{Path, PathBuf},
-};
+use std::{io::Write as _, path::PathBuf};
 
-use candle_core::{DType, Device, IntDType, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 use candle_datasets::vision::cifar;
 use candle_nn::{
     BatchNormConfig, Conv2d, Linear, Module, ModuleT, Optimizer, VarBuilder, VarMap, linear,
