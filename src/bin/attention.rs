@@ -1,8 +1,17 @@
-use candle_core::{D, Device, Result, Tensor};
+use std::{io::Write, path::PathBuf};
+
+use candle_core::{D, DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{
-    Embedding, LayerNorm, LayerNormConfig, Linear, Module, VarBuilder, embedding, layer_norm,
-    linear, ops::softmax,
+    AdamW, Embedding, LayerNorm, LayerNormConfig, Linear, Module, Optimizer as _, VarBuilder,
+    VarMap, embedding, layer_norm, linear, loss::cross_entropy, ops::softmax,
 };
+use candle_playground::{
+    Timer,
+    cli::{Cli, Command},
+    text::{Corpus, batch_data, generate_batches},
+};
+use clap::Parser as _;
+use rand::RngExt;
 
 pub struct SelfAttention {
     query: Linear,
@@ -12,6 +21,7 @@ pub struct SelfAttention {
     scale: f64,
 }
 
+#[allow(dead_code)]
 impl SelfAttention {
     pub fn new(vb: VarBuilder, hidden_size: usize) -> Result<Self> {
         let query = linear(hidden_size, hidden_size, vb.pp("query"))?;
@@ -59,7 +69,6 @@ impl MultiHeadAttention {
     pub fn new(vb: VarBuilder, hidden_size: usize, num_heads: usize) -> Result<Self> {
         assert!(hidden_size % num_heads == 0);
         let head_size = hidden_size / num_heads;
-        let hidden_size = head_size * num_heads;
         let query = linear(hidden_size, hidden_size, vb.pp("query"))?;
         let key = linear(hidden_size, hidden_size, vb.pp("key"))?;
         let value = linear(hidden_size, hidden_size, vb.pp("value"))?;
@@ -249,6 +258,147 @@ impl Model {
     }
 }
 
-fn main() -> Result<()> {
+struct TrainingConfig {
+    epochs: usize,
+    output_file: Option<PathBuf>,
+    model_cfg: ModelConfig,
+    window_size: usize,
+    batch_size: usize,
+    learning_rate: f64,
+}
+
+fn train(
+    indices: &[u8],
+    config: TrainingConfig,
+    dev: &Device,
+    rng: &mut impl RngExt,
+) -> anyhow::Result<Model> {
+    let var_map = VarMap::new();
+    let vb = VarBuilder::from_varmap(&var_map, DType::F32, dev);
+    let vocab_size = config.model_cfg.vocab_size;
+    let model = Model::new(vb, config.model_cfg, dev)?;
+    let mut optimizer = AdamW::new_lr(var_map.all_vars(), config.learning_rate)?;
+    let epochs = config.epochs;
+    let causal_mask = causal_mask(config.window_size, dev)?;
+    println!("");
+    for epoch in 0..epochs {
+        let epoch_timer = Timer::new();
+        let mut epoch_loss = 0.0;
+        let batches = generate_batches(indices, config.window_size, config.batch_size, rng)?;
+        let num_batches = batches.len();
+        for (batch_idx, batch) in batches.iter().enumerate() {
+            let (inputs, targets) = batch_data(&batch, vocab_size, dev)?;
+            let logits = model.forward(&inputs, Some(&causal_mask))?;
+            let (b, s, v) = logits.dims3()?;
+            let loss = cross_entropy(&logits.reshape((b * s, v))?, &targets)?;
+            optimizer.backward_step(&loss)?;
+            let batch_loss = loss.to_scalar::<f32>()?;
+            epoch_loss += batch_loss;
+            print!("Epoch {epoch}; Batch {batch_idx}/{num_batches}; Loss {batch_loss:.6};\r");
+            std::io::stdout().flush()?;
+        }
+        let epoch_loss = epoch_loss / num_batches as f32;
+        println!(
+            "\n Epoch {epoch}/{epochs}; Epoch Loss {epoch_loss:.6}; Took {:.3}",
+            epoch_timer.elapsed()
+        )
+    }
+
+    if let Some(file) = config.output_file {
+        if let Err(e) = var_map.save(file) {
+            eprint!("Error saving model: {e}")
+        }
+    }
+
+    Ok(model)
+}
+
+fn sample(
+    model: &Model,
+    seed: &str,
+    n: usize,
+    temp: f64,
+    corpus: &Corpus,
+    dev: &Device,
+    rng: &mut impl RngExt,
+) -> anyhow::Result<String> {
+    let mut ctx: Vec<u32> = seed
+        .chars()
+        .map(|c| corpus.char_to_index(c))
+        .map(|r| r.map(|i| i as u32))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut out = String::from(seed);
+
+    for _ in 0..n {
+        // one-hot the current context
+        let seq_len = ctx.len();
+        let causal_mask = causal_mask(seq_len, dev)?;
+        let input = Tensor::from_slice(&ctx, (1, seq_len), dev)?;
+
+        let logits = model.forward(&input, Some(&causal_mask))?; // [1, seq_len, vocab]
+        let last = logits.i((0, seq_len - 1))?; // [vocab]
+        let probs = candle_nn::ops::softmax(&(last / temp)?, 0)?.to_vec1::<f32>()?;
+
+        // sample from the distribution
+        let r: f32 = rng.random();
+        let mut acc = 0.0;
+        let mut pick = 0u8;
+        for (i, p) in probs.iter().enumerate() {
+            acc += p;
+            if acc >= r {
+                pick = i as u8;
+                break;
+            }
+        }
+
+        out.push(corpus.index_to_char(pick)?);
+        ctx.push(pick as u32);
+        if ctx.len() > 100 {
+            ctx.remove(0);
+        } // keep context bounded
+    }
+    Ok(out)
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let dev = Device::Cpu;
+    let mut rng = rand::rng();
+    let corpus = Corpus::from_text_file("data/capek.txt")?;
+    let vocab_size = corpus.vocab_size();
+    let model_cfg = ModelConfig {
+        vocab_size,
+        ..Default::default()
+    };
+
+    match cli.command {
+        Command::Train { epochs } => {
+            let corpus_indexed: Vec<u8> = corpus.indexed_corpus();
+
+            let training_config = TrainingConfig {
+                epochs,
+                output_file: Some(cli.file),
+                model_cfg,
+                window_size: 100,
+                batch_size: 64,
+                learning_rate: 0.001,
+            };
+
+            let _model = train(&corpus_indexed, training_config, &dev, &mut rng)?;
+        }
+        Command::Sample {
+            context,
+            size,
+            temp,
+        } => {
+            let mut var_map = VarMap::new();
+            let vb = VarBuilder::from_varmap(&var_map, DType::F32, &dev);
+            let model = Model::new(vb, model_cfg, &dev)?;
+            var_map.load(&cli.file)?;
+            let output = sample(&model, &context, size, temp, &corpus, &dev, &mut rng)?;
+            println!("For context: {context} model generated:");
+            println!("{output}");
+        }
+    }
     Ok(())
 }

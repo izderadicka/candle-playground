@@ -8,9 +8,10 @@ use candle_nn::{
 };
 use candle_playground::{
     Timer,
+    cli::{Cli, Command},
     text::{Corpus, batch_data, generate_batches},
 };
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use rand::RngExt;
 
 pub struct Model {
@@ -95,8 +96,6 @@ fn train(
     Ok(model)
 }
 
-const WINDOW_SIZE: usize = 100;
-
 fn sample(
     model: &Model,
     seed: &str,
@@ -142,38 +141,6 @@ fn sample(
         } // keep context bounded
     }
     Ok(out)
-}
-
-#[derive(Parser)]
-struct Cli {
-    /// Model file
-    #[arg(
-        short,
-        long,
-        default_value = "output/lstm.safetensors",
-        help = "model parameters file"
-    )]
-    file: PathBuf,
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Train the model and save it to the model file
-    Train {
-        #[arg(short, long, default_value = "32", help = "number of epochs")]
-        epochs: usize,
-    },
-    /// Sample text from a trained model
-    Sample {
-        #[arg(short, long, help = "Context to start with")]
-        context: String,
-        #[arg(short, long, help = "Number of characters to generate")]
-        size: usize,
-        #[arg(short, long, default_value = "1.0", help = "Temperature")]
-        temp: f64,
-    },
 }
 
 fn main() -> anyhow::Result<()> {
