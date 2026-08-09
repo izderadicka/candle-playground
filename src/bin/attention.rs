@@ -264,11 +264,13 @@ impl Model {
 
 struct TrainingConfig {
     epochs: usize,
-    output_file: Option<PathBuf>,
+    output_file: PathBuf,
     model_cfg: ModelConfig,
     window_size: usize,
     batch_size: usize,
     learning_rate: f64,
+    checkpoint: Option<PathBuf>,
+    checkpoint_every: usize,
 }
 
 fn train(
@@ -277,12 +279,17 @@ fn train(
     dev: &Device,
     rng: &mut impl RngExt,
 ) -> anyhow::Result<Model> {
-    let var_map = VarMap::new();
+    let mut var_map = VarMap::new();
     let vb = VarBuilder::from_varmap(&var_map, DType::F32, dev);
     let model = Model::new(vb, config.model_cfg, dev)?;
+    if let Some(checkpoint) = config.checkpoint {
+        var_map.load(&checkpoint)?;
+    }
     let mut optimizer = AdamW::new_lr(var_map.all_vars(), config.learning_rate)?;
     let epochs = config.epochs;
     let causal_mask = causal_mask(config.window_size, dev)?;
+    let mut cpt_file = config.output_file.clone();
+    cpt_file.add_extension("ckp");
     println!("");
     for epoch in 0..epochs {
         let epoch_timer = Timer::new();
@@ -304,27 +311,97 @@ fn train(
         println!(
             "\n Epoch {epoch}/{epochs}; Epoch Loss {epoch_loss:.6}; Took {:.3}",
             epoch_timer.elapsed()
-        )
+        );
+
+        if config.checkpoint_every > 0 && epoch > 0 && epoch % config.checkpoint_every == 0 {
+            if let Err(e) = var_map.save(&cpt_file) {
+                eprintln!("Error saving checkpoint: {e}");
+            }
+        }
     }
 
-    if let Some(file) = config.output_file {
-        if let Err(e) = var_map.save(file) {
-            eprint!("Error saving model: {e}")
-        }
+    if let Err(e) = var_map.save(config.output_file) {
+        eprint!("Error saving model: {e}")
     }
 
     Ok(model)
 }
 
+struct SamplingConfig {
+    temp: f64,
+    top_k: Option<usize>,
+    top_p: Option<f32>,
+    model_file: PathBuf,
+    max_context_size: usize,
+    model_cfg: ModelConfig,
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        Self {
+            temp: 0.7,
+            top_k: Some(10),
+            top_p: Some(0.9),
+            model_file: Default::default(),
+            max_context_size: 100,
+            model_cfg: Default::default(),
+        }
+    }
+}
+
+fn apply_selection(
+    probs: Vec<f32>,
+    top_k: Option<usize>,
+    top_p: Option<f32>,
+    rng: &mut impl RngExt,
+) -> u32 {
+    let mut indices: Vec<_> = (0..probs.len()).collect();
+    indices.sort_by(|a, b| probs[*b].total_cmp(&probs[*a]));
+    if let Some(k) = top_k {
+        indices.truncate(k);
+    }
+    if let Some(p) = top_p {
+        let mut acc_p = 0.0;
+        let mut idx = 0;
+        while idx < indices.len() {
+            acc_p += probs[indices[idx]];
+            if acc_p >= p {
+                break;
+            }
+            idx += 1
+        }
+        indices.truncate(idx + 1)
+    }
+    let sum: f32 = indices.iter().map(|i| probs[*i]).sum();
+
+    // sample from the distribution
+    let r: f32 = rng.random();
+    let mut acc = 0.0;
+    let mut pick = indices.last().map(|i| u32::try_from(*i).unwrap()).unwrap();
+    for i in indices {
+        let p = probs[i] / sum;
+        acc += p;
+        if acc >= r {
+            pick = i.try_into().unwrap();
+            break;
+        }
+    }
+
+    pick
+}
+
 fn sample(
-    model: &Model,
     seed: &str,
     n: usize,
-    temp: f64,
+    config: SamplingConfig,
     corpus: &Corpus,
     dev: &Device,
     rng: &mut impl RngExt,
 ) -> anyhow::Result<String> {
+    let mut var_map = VarMap::new();
+    let vb = VarBuilder::from_varmap(&var_map, DType::F32, &dev);
+    let model = Model::new(vb, config.model_cfg, &dev)?;
+    var_map.load(&config.model_file)?;
     let mut ctx: Vec<u32> = seed
         .chars()
         .map(|c| corpus.char_to_index(c))
@@ -340,23 +417,13 @@ fn sample(
 
         let logits = model.forward(&input, Some(&causal_mask))?; // [1, seq_len, vocab]
         let last = logits.i((0, seq_len - 1))?; // [vocab]
-        let probs = candle_nn::ops::softmax(&(last / temp)?, 0)?.to_vec1::<f32>()?;
+        let probs = candle_nn::ops::softmax(&(last / config.temp)?, 0)?.to_vec1::<f32>()?;
 
-        // sample from the distribution
-        let r: f32 = rng.random();
-        let mut acc = 0.0;
-        let mut pick = 0u8;
-        for (i, p) in probs.iter().enumerate() {
-            acc += p;
-            if acc >= r {
-                pick = i as u8;
-                break;
-            }
-        }
+        let pick = apply_selection(probs, config.top_k, config.top_p, rng);
 
-        out.push(corpus.index_to_char(pick)?);
-        ctx.push(pick as u32);
-        if ctx.len() > 100 {
+        out.push(corpus.index_to_char(pick.try_into().unwrap())?);
+        ctx.push(pick);
+        if ctx.len() > config.max_context_size {
             ctx.remove(0);
         } // keep context bounded
     }
@@ -375,16 +442,18 @@ fn main() -> anyhow::Result<()> {
     };
 
     match cli.command {
-        Command::Train { epochs } => {
+        Command::Train { epochs, checkpoint } => {
             let corpus_indexed: Vec<u8> = corpus.indexed_corpus();
 
             let training_config = TrainingConfig {
                 epochs,
-                output_file: Some(cli.file),
+                output_file: cli.file,
                 model_cfg,
                 window_size: 100,
                 batch_size: 64,
                 learning_rate: 0.001,
+                checkpoint,
+                checkpoint_every: 5,
             };
 
             let _model = train(&corpus_indexed, training_config, &dev, &mut rng)?;
@@ -393,12 +462,18 @@ fn main() -> anyhow::Result<()> {
             context,
             size,
             temp,
+            top_k,
+            top_p,
         } => {
-            let mut var_map = VarMap::new();
-            let vb = VarBuilder::from_varmap(&var_map, DType::F32, &dev);
-            let model = Model::new(vb, model_cfg, &dev)?;
-            var_map.load(&cli.file)?;
-            let output = sample(&model, &context, size, temp, &corpus, &dev, &mut rng)?;
+            let cfg = SamplingConfig {
+                temp,
+                top_k,
+                top_p,
+                model_cfg,
+                model_file: cli.file,
+                ..Default::default()
+            };
+            let output = sample(&context, size, cfg, &corpus, &dev, &mut rng)?;
             println!("For context: {context} model generated:");
             println!("{output}");
         }

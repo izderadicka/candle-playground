@@ -16,6 +16,8 @@ pub enum Command {
     Train {
         #[arg(short, long, default_value = "32", help = "number of epochs")]
         epochs: usize,
+        #[arg(short, long, help = "Saved model to start with")]
+        checkpoint: Option<PathBuf>,
     },
     /// Sample text from a trained model
     Sample {
@@ -25,5 +27,9 @@ pub enum Command {
         size: usize,
         #[arg(short, long, default_value = "1.0", help = "Temperature")]
         temp: f64,
+        #[arg(long, help = "top-k to sample from token probabilities")]
+        top_k: Option<usize>,
+        #[arg(long, help = "top-p to sample from token probabilities")]
+        top_p: Option<f32>,
     },
 }

@@ -151,7 +151,7 @@ fn main() -> anyhow::Result<()> {
     let vocab_size = corpus.vocab_size();
 
     match cli.command {
-        Command::Train { epochs } => {
+        Command::Train { epochs, .. } => {
             let corpus_indexed: Vec<u8> = corpus.indexed_corpus();
 
             let training_config = TrainingConfig {
@@ -169,6 +169,7 @@ fn main() -> anyhow::Result<()> {
             context,
             size,
             temp,
+            ..
         } => {
             let mut var_map = VarMap::new();
             let vb = VarBuilder::from_varmap(&var_map, DType::F32, &dev);
