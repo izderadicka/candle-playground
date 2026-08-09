@@ -1,4 +1,4 @@
-use std::{io::Write, path::PathBuf};
+use std::{io::Write, path::PathBuf, sync::Arc};
 
 use candle_core::{D, DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{
@@ -55,6 +55,53 @@ impl SelfAttention {
     }
 }
 
+pub struct Rope {
+    cos: Tensor,
+    sin: Tensor,
+}
+
+impl Rope {
+    pub fn new(max_seq_length: usize, head_size: usize, dev: &Device) -> Result<Self> {
+        let half_size = head_size / 2;
+        let mut c = Vec::with_capacity(max_seq_length * half_size);
+        let mut s = Vec::with_capacity(max_seq_length * half_size);
+
+        for pos in 0..max_seq_length {
+            for i in 0..half_size {
+                let theta = pos as f32 / 10_000f32.powf(2.0 * i as f32 / head_size as f32);
+                c.push(theta.cos());
+                s.push(theta.sin());
+            }
+        }
+
+        let cos = Tensor::from_vec(c, (max_seq_length, half_size), dev)?;
+        let sin = Tensor::from_vec(s, (max_seq_length, half_size), dev)?;
+
+        Ok(Self { sin, cos })
+    }
+
+    pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
+        let (_b, _heads, seq_size, head_size) = x.dims4()?;
+        let half_size = head_size / 2;
+        let cos = self
+            .cos
+            .narrow(0, 0, seq_size)?
+            .reshape((1, 1, seq_size, half_size))?;
+        let sin = self
+            .sin
+            .narrow(0, 0, seq_size)?
+            .reshape((1, 1, seq_size, half_size))?;
+
+        let x0 = x.narrow(D::Minus1, 0, half_size)?;
+        let x1 = x.narrow(D::Minus1, half_size, half_size)?;
+
+        let y0 = (x0.broadcast_mul(&cos)? - x1.broadcast_mul(&sin)?)?;
+        let y1 = (x0.broadcast_mul(&sin)? + x1.broadcast_mul(&cos)?)?;
+
+        Tensor::cat(&[&y0, &y1], D::Minus1)
+    }
+}
+
 pub struct MultiHeadAttention {
     query: Linear,
     key: Linear,
@@ -63,10 +110,16 @@ pub struct MultiHeadAttention {
     num_heads: usize,
     head_size: usize, // one head size = embedding size
     scale: f64,
+    rope: Arc<Rope>,
 }
 
 impl MultiHeadAttention {
-    pub fn new(vb: VarBuilder, hidden_size: usize, num_heads: usize) -> Result<Self> {
+    pub fn new(
+        vb: VarBuilder,
+        hidden_size: usize,
+        num_heads: usize,
+        rope: Arc<Rope>,
+    ) -> Result<Self> {
         assert!(hidden_size % num_heads == 0);
         let head_size = hidden_size / num_heads;
         let query = linear(hidden_size, hidden_size, vb.pp("query"))?;
@@ -82,6 +135,7 @@ impl MultiHeadAttention {
             scale,
             head_size,
             num_heads,
+            rope,
         })
     }
 
@@ -93,8 +147,8 @@ impl MultiHeadAttention {
                 .transpose(1, 2)?
                 .contiguous()
         };
-        let q = split_heads(self.query.forward(x)?)?; // [b,heads,s,h]
-        let k = split_heads(self.key.forward(x)?)?;
+        let q = self.rope.apply(&split_heads(self.query.forward(x)?)?)?; // [b,heads,s,h]
+        let k = self.rope.apply(&split_heads(self.key.forward(x)?)?)?;
         let v = split_heads(self.value.forward(x)?)?;
 
         let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * self.scale)?; // [b,heads,s,s]
@@ -137,8 +191,13 @@ struct SelfAttentionLayer {
 }
 
 impl SelfAttentionLayer {
-    pub fn new(vb: VarBuilder, hidden_size: usize, num_heads: usize) -> Result<Self> {
-        let attention = MultiHeadAttention::new(vb.pp("attention"), hidden_size, num_heads)?;
+    pub fn new(
+        vb: VarBuilder,
+        hidden_size: usize,
+        num_heads: usize,
+        rope: Arc<Rope>,
+    ) -> Result<Self> {
+        let attention = MultiHeadAttention::new(vb.pp("attention"), hidden_size, num_heads, rope)?;
         let norm_config = LayerNormConfig::default();
         let norm1 = layer_norm(hidden_size, norm_config, vb.pp("norm1"))?;
         let ff1 = linear(hidden_size, 4 * hidden_size, vb.pp("ff1"))?;
@@ -163,12 +222,14 @@ impl SelfAttentionLayer {
     }
 }
 
+#[allow(dead_code)]
 struct SinPositionalEncoding {
     encoding: Tensor,
 }
 
+#[allow(dead_code)]
 impl SinPositionalEncoding {
-    fn new(max_seq_length: usize, hidden_size: usize, device: &Device) -> Result<Self> {
+    pub fn new(max_seq_length: usize, hidden_size: usize, device: &Device) -> Result<Self> {
         // Create positional encoding matrix
         let mut encoding = vec![0.0; max_seq_length * hidden_size];
 
@@ -188,7 +249,7 @@ impl SinPositionalEncoding {
         Ok(Self { encoding })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (_b, seq_len, _h) = x.dims3()?;
         let pe = self.encoding.narrow(0, 0, seq_len)?;
         x.broadcast_add(&pe)
@@ -197,7 +258,6 @@ impl SinPositionalEncoding {
 
 pub struct Model {
     embed: Embedding,
-    pos: SinPositionalEncoding, // Positional encoding
     layers: Vec<SelfAttentionLayer>,
     norm_final: LayerNorm,
     output: Linear,
@@ -225,16 +285,21 @@ impl Default for ModelConfig {
 
 impl Model {
     pub fn new(vb: VarBuilder, cfg: ModelConfig, dev: &Device) -> Result<Self> {
+        let rope = Arc::new(Rope::new(
+            cfg.max_seq_size,
+            cfg.hidden_size / cfg.num_heads,
+            dev,
+        )?);
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             layers.push(SelfAttentionLayer::new(
                 vb.pp(format!("layer{i}")),
                 cfg.hidden_size,
                 cfg.num_heads,
+                rope.clone(),
             )?);
         }
         let embed = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed"))?;
-        let pos = SinPositionalEncoding::new(cfg.max_seq_size, cfg.hidden_size, dev)?;
         let norm_final = layer_norm(
             cfg.hidden_size,
             LayerNormConfig::default(),
@@ -244,7 +309,6 @@ impl Model {
 
         Ok(Self {
             embed,
-            pos,
             layers,
             norm_final,
             output,
@@ -252,8 +316,7 @@ impl Model {
     }
 
     pub fn forward(&self, x: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
-        let y = self.embed.forward(x)?;
-        let mut h = self.pos.forward(&y)?;
+        let mut h = self.embed.forward(x)?;
         for layer in &self.layers {
             h = layer.forward(&h, mask)?;
         }
@@ -377,7 +440,7 @@ fn apply_selection(
     // sample from the distribution
     let r: f32 = rng.random();
     let mut acc = 0.0;
-    let mut pick = indices.last().map(|i| u32::try_from(*i).unwrap()).unwrap();
+    let mut pick = indices.first().map(|i| u32::try_from(*i).unwrap()).unwrap();
     for i in indices {
         let p = probs[i] / sum;
         acc += p;
@@ -430,6 +493,9 @@ fn sample(
     Ok(out)
 }
 
+//best sampling performace is achieved when training window size is same as max context in sampling
+const WINDOW_SIZE: usize = 100;
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let dev = Device::Cpu;
@@ -449,7 +515,7 @@ fn main() -> anyhow::Result<()> {
                 epochs,
                 output_file: cli.file,
                 model_cfg,
-                window_size: 100,
+                window_size: WINDOW_SIZE,
                 batch_size: 64,
                 learning_rate: 0.001,
                 checkpoint,
@@ -471,6 +537,7 @@ fn main() -> anyhow::Result<()> {
                 top_p,
                 model_cfg,
                 model_file: cli.file,
+                max_context_size: WINDOW_SIZE,
                 ..Default::default()
             };
             let output = sample(&context, size, cfg, &corpus, &dev, &mut rng)?;
