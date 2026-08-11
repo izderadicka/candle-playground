@@ -11,4 +11,5 @@ candle-nn = { version = "0.11.0", path = "../candle/candle-nn" }
 clap = { version = "4.6.4", features = ["derive"] }
 itertools = "0.15.0"
 rand = "0.10.2"
+tokenizers = "0.23.1"
 tqdm = "0.8.0"

@@ -12,7 +12,14 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Train the model and save it to the model file
+    Tokenize {
+        #[arg(short, long, help = "number of tokens in vocabulary generated")]
+        num_tokens: usize,
+        #[arg(short, long, help = "text file with corpus")]
+        corpus: PathBuf,
+        #[arg(long, help = "merge characters instead of bytes")]
+        chars: bool,
+    },
     Train {
         #[arg(short, long, default_value = "32", help = "number of epochs")]
         epochs: usize,

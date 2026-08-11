@@ -9,6 +9,7 @@ use candle_playground::{
     Timer,
     cli::{Cli, Command},
     text::{Corpus, batch_data, generate_batches},
+    token,
 };
 use clap::Parser as _;
 use rand::RngExt;
@@ -543,6 +544,18 @@ fn main() -> anyhow::Result<()> {
             let output = sample(&context, size, cfg, &corpus, &dev, &mut rng)?;
             println!("For context: {context} model generated:");
             println!("{output}");
+        }
+        Command::Tokenize {
+            num_tokens,
+            corpus,
+            chars,
+        } => {
+            let train = if chars {
+                token::train_chars
+            } else {
+                token::train
+            };
+            train(&corpus, num_tokens, &cli.file).map_err(|e| anyhow::anyhow!(e))?;
         }
     }
     Ok(())

@@ -179,6 +179,9 @@ fn main() -> anyhow::Result<()> {
             println!("For context: {context} model generated:");
             println!("{output}");
         }
+        _ => {
+            panic!("Not implemented")
+        }
     }
     Ok(())
 }

@@ -3,6 +3,7 @@ use candle_nn::ModuleT;
 
 pub mod cli;
 pub mod text;
+pub mod token;
 
 pub fn test_classification(
     model: &impl ModuleT,
