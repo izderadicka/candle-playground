@@ -8,8 +8,7 @@ use candle_nn::{
 use candle_playground::{
     Timer,
     cli::{Cli, Command},
-    text::{Corpus, batch_data, generate_batches},
-    token,
+    token::{self, Corpus, batch_data, generate_batches},
 };
 use clap::Parser as _;
 use rand::RngExt;
@@ -338,7 +337,7 @@ struct TrainingConfig {
 }
 
 fn train(
-    indices: &[u8],
+    indices: &[u32],
     config: TrainingConfig,
     dev: &Device,
     rng: &mut impl RngExt,
@@ -466,12 +465,17 @@ fn sample(
     let vb = VarBuilder::from_varmap(&var_map, DType::F32, &dev);
     let model = Model::new(vb, config.model_cfg, &dev)?;
     var_map.load(&config.model_file)?;
-    let mut ctx: Vec<u32> = seed
-        .chars()
-        .map(|c| corpus.char_to_index(c))
-        .map(|r| r.map(|i| i as u32))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let mut out = String::from(seed);
+    let mut ctx: Vec<u32> = corpus.encode(seed)?;
+    if ctx.is_empty() {
+        anyhow::bail!("Seed encodes to no tokens - give a non empty context");
+    }
+    if ctx.len() > config.max_context_size {
+        ctx.drain(..ctx.len() - config.max_context_size);
+    }
+    // ctx is the sliding window fed to the model, generated is everything we
+    // produced - BPE tokens carry their own spacing, so the whole run is
+    // decoded in one go at the end rather than token by token
+    let mut generated = ctx.clone();
 
     for _ in 0..n {
         // one-hot the current context
@@ -485,36 +489,40 @@ fn sample(
 
         let pick = apply_selection(probs, config.top_k, config.top_p, rng);
 
-        out.push(corpus.index_to_char(pick.try_into().unwrap())?);
+        generated.push(pick);
         ctx.push(pick);
         if ctx.len() > config.max_context_size {
             ctx.remove(0);
         } // keep context bounded
     }
-    Ok(out)
+    corpus.decode(&generated)
 }
 
 //best sampling performace is achieved when training window size is same as max context in sampling
+// now counted in tokens, not characters
 const WINDOW_SIZE: usize = 100;
+const CORPUS_FILE: &str = "data/capek.txt";
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let dev = Device::Cpu;
     let mut rng = rand::rng();
-    let corpus = Corpus::from_text_file("data/capek.txt")?;
-    let vocab_size = corpus.vocab_size();
-    let model_cfg = ModelConfig {
-        vocab_size,
-        ..Default::default()
-    };
 
     match cli.command {
-        Command::Train { epochs, checkpoint } => {
-            let corpus_indexed: Vec<u8> = corpus.indexed_corpus();
+        Command::Train {
+            model,
+            epochs,
+            checkpoint,
+        } => {
+            let corpus = Corpus::from_files(&cli.tokenizer, CORPUS_FILE)?;
+            let model_cfg = ModelConfig {
+                vocab_size: corpus.vocab_size(),
+                ..Default::default()
+            };
 
             let training_config = TrainingConfig {
                 epochs,
-                output_file: cli.file,
+                output_file: model,
                 model_cfg,
                 window_size: WINDOW_SIZE,
                 batch_size: 64,
@@ -523,23 +531,29 @@ fn main() -> anyhow::Result<()> {
                 checkpoint_every: 5,
             };
 
-            let _model = train(&corpus_indexed, training_config, &dev, &mut rng)?;
+            let _model = train(corpus.tokens(), training_config, &dev, &mut rng)?;
         }
         Command::Sample {
+            model,
             context,
             size,
             temp,
             top_k,
             top_p,
         } => {
+            // sampling only needs the tokenizer, not the corpus text
+            let corpus = Corpus::from_tokenizer_file(&cli.tokenizer)?;
+            let model_cfg = ModelConfig {
+                vocab_size: corpus.vocab_size(),
+                ..Default::default()
+            };
             let cfg = SamplingConfig {
                 temp,
                 top_k,
                 top_p,
                 model_cfg,
-                model_file: cli.file,
+                model_file: model,
                 max_context_size: WINDOW_SIZE,
-                ..Default::default()
             };
             let output = sample(&context, size, cfg, &corpus, &dev, &mut rng)?;
             println!("For context: {context} model generated:");
@@ -555,7 +569,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 token::train
             };
-            train(&corpus, num_tokens, &cli.file).map_err(|e| anyhow::anyhow!(e))?;
+            train(&corpus, num_tokens, &cli.tokenizer).map_err(|e| anyhow::anyhow!(e))?;
         }
     }
     Ok(())

@@ -3,9 +3,15 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 pub struct Cli {
-    /// Model file
-    #[arg(short, long, help = "model parameters file")]
-    pub file: PathBuf,
+    /// tokenizer.json - written by `tokenize`, read by `train` and `sample`
+    #[arg(
+        short,
+        long,
+        global = true,
+        default_value = "data/capek-tokens.json",
+        help = "tokenizer file"
+    )]
+    pub tokenizer: PathBuf,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -21,6 +27,8 @@ pub enum Command {
         chars: bool,
     },
     Train {
+        #[arg(short, long, help = "model parameters file")]
+        model: PathBuf,
         #[arg(short, long, default_value = "32", help = "number of epochs")]
         epochs: usize,
         #[arg(short, long, help = "Saved model to start with")]
@@ -28,11 +36,14 @@ pub enum Command {
     },
     /// Sample text from a trained model
     Sample {
+        #[arg(short, long, help = "model parameters file")]
+        model: PathBuf,
         #[arg(short, long, help = "Context to start with")]
         context: String,
-        #[arg(short, long, help = "Number of characters to generate")]
+        #[arg(short, long, help = "Number of tokens to generate")]
         size: usize,
-        #[arg(short, long, default_value = "1.0", help = "Temperature")]
+        // -t is taken by the global --tokenizer
+        #[arg(short = 'T', long, default_value = "1.0", help = "Temperature")]
         temp: f64,
         #[arg(long, help = "top-k to sample from token probabilities")]
         top_k: Option<usize>,

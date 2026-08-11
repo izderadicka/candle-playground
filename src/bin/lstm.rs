@@ -151,12 +151,12 @@ fn main() -> anyhow::Result<()> {
     let vocab_size = corpus.vocab_size();
 
     match cli.command {
-        Command::Train { epochs, .. } => {
+        Command::Train { model, epochs, .. } => {
             let corpus_indexed: Vec<u8> = corpus.indexed_corpus();
 
             let training_config = TrainingConfig {
                 epochs,
-                output_file: Some(cli.file),
+                output_file: Some(model),
                 vocab_size,
                 window_size: 100,
                 batch_size: 64,
@@ -166,6 +166,7 @@ fn main() -> anyhow::Result<()> {
             let _model = train(&corpus_indexed, training_config, &dev, &mut rng)?;
         }
         Command::Sample {
+            model: model_file,
             context,
             size,
             temp,
@@ -174,7 +175,7 @@ fn main() -> anyhow::Result<()> {
             let mut var_map = VarMap::new();
             let vb = VarBuilder::from_varmap(&var_map, DType::F32, &dev);
             let model = Model::new(vb, vocab_size)?;
-            var_map.load(&cli.file)?;
+            var_map.load(&model_file)?;
             let output = sample(&model, &context, size, temp, &corpus, &dev, &mut rng)?;
             println!("For context: {context} model generated:");
             println!("{output}");
