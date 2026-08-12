@@ -29,7 +29,7 @@ pub enum Command {
     Train {
         #[arg(short, long, help = "model parameters file")]
         model: PathBuf,
-        #[arg(short, long, default_value = "32", help = "number of epochs")]
+        #[arg(short, long, default_value = "8", help = "number of epochs")]
         epochs: usize,
         #[arg(short, long, help = "Saved model to start with")]
         checkpoint: Option<PathBuf>,

@@ -173,6 +173,13 @@ pub fn generate_batches(
     batch_size: usize,
     rng: &mut impl RngExt,
 ) -> anyhow::Result<Batches> {
+    // `tokens.len() - window_size` below wraps rather than panicking in release
+    if tokens.len() <= window_size {
+        anyhow::bail!(
+            "not enough tokens to batch: {} tokens for a window of {window_size}",
+            tokens.len()
+        );
+    }
     let start = rng.random_range(0..window_size);
     let mut window_starts: Vec<usize> = (start..tokens.len() - window_size)
         .step_by(window_size)
@@ -246,6 +253,37 @@ mod tests {
             assert!(
                 corpus.tokenizer().id_to_token(id).is_some(),
                 "id {id} decodes to nothing"
+            );
+        }
+        Ok(())
+    }
+
+    /// How well the corpus compresses at each vocabulary size, which is what
+    /// decides the cost of an epoch: a bigger vocabulary means a bigger output
+    /// layer but fewer tokens to train on.
+    ///
+    /// `cargo test --lib -- --ignored --nocapture`
+    #[test]
+    #[ignore = "trains several tokenizers, takes a minute"]
+    fn compression_by_vocab_size() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join("capek-vocab-sweep");
+        std::fs::create_dir_all(&dir)?;
+        let chars = std::fs::read_to_string(CORPUS)?.chars().count();
+
+        println!("\ncorpus: {chars} chars");
+        println!("{:>6} {:>10} {:>12} {:>12}", "vocab", "tokens", "chars/token", "windows@200");
+        for vocab_size in [1000, 2000, 4000] {
+            let file = dir.join(format!("{vocab_size}.json"));
+            train_chars(CORPUS, vocab_size, &file).map_err(|e| anyhow::anyhow!(e))?;
+
+            let corpus = Corpus::from_files(&file, CORPUS)?;
+            let tokens = corpus.tokens().len();
+            println!(
+                "{:>6} {:>10} {:>12.2} {:>12}",
+                corpus.vocab_size(),
+                tokens,
+                chars as f64 / tokens as f64,
+                tokens / 200
             );
         }
         Ok(())

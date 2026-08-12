@@ -8,7 +8,7 @@ use candle_nn::{
 use candle_playground::{
     Timer,
     cli::{Cli, Command},
-    token::{self, Corpus, batch_data, generate_batches},
+    token::{self, Batches, Corpus, batch_data, generate_batches},
 };
 use clap::Parser as _;
 use rand::RngExt;
@@ -275,8 +275,10 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             vocab_size: 122,
-            hidden_size: 128,
-            num_heads: 4,
+            hidden_size: 256,
+            // heads are free - heads * head_size = hidden_size, so the score
+            // matmul is the same work either way. head_size 32 keeps 16 rope bands
+            num_heads: 8,
             num_layers: 4,
             max_seq_size: 256,
         }
@@ -336,8 +338,45 @@ struct TrainingConfig {
     checkpoint_every: usize,
 }
 
+/// Contiguous windows from offset 0, no shuffling and no random start - the
+/// validation number has to mean the same thing from one run to the next.
+///
+/// Empty if there are not enough tokens for a single window.
+fn validation_batches(tokens: &[u32], window_size: usize, batch_size: usize) -> Batches {
+    tokens
+        .windows(window_size + 1)
+        .step_by(window_size)
+        .map(Vec::from)
+        .collect::<Vec<_>>()
+        .chunks(batch_size)
+        .map(Vec::from)
+        .collect()
+}
+
+/// Mean loss over the held out batches - forward only, no backward step.
+/// `None` when there is nothing to validate on.
+fn evaluate(
+    model: &Model,
+    batches: &Batches,
+    causal_mask: &Tensor,
+    dev: &Device,
+) -> anyhow::Result<Option<f32>> {
+    if batches.is_empty() {
+        return Ok(None);
+    }
+    let mut total = 0.0;
+    for batch in batches {
+        let (inputs, targets) = batch_data(batch, dev)?;
+        let logits = model.forward(&inputs, Some(causal_mask))?;
+        let (b, s, v) = logits.dims3()?;
+        total += cross_entropy(&logits.reshape((b * s, v))?, &targets)?.to_scalar::<f32>()?;
+    }
+    Ok(Some(total / batches.len() as f32))
+}
+
 fn train(
     indices: &[u32],
+    validation: &[u32],
     config: TrainingConfig,
     dev: &Device,
     rng: &mut impl RngExt,
@@ -353,6 +392,13 @@ fn train(
     let causal_mask = causal_mask(config.window_size, dev)?;
     let mut cpt_file = config.output_file.clone();
     cpt_file.add_extension("ckp");
+    let mut best_file = config.output_file.clone();
+    best_file.add_extension("best");
+
+    // Tiled from offset 0 without shuffling, unlike the training batches, so the
+    // validation loss is comparable across runs and not just across epochs.
+    let val_batches = validation_batches(validation, config.window_size, config.batch_size);
+    let mut best_loss = f32::INFINITY;
     println!("");
     for epoch in 0..epochs {
         let epoch_timer = Timer::new();
@@ -371,14 +417,32 @@ fn train(
             std::io::stdout().flush()?;
         }
         let epoch_loss = epoch_loss / num_batches as f32;
-        println!(
-            "\n Epoch {epoch}/{epochs}; Epoch Loss {epoch_loss:.6}; Took {:.3}",
-            epoch_timer.elapsed()
-        );
 
-        if config.checkpoint_every > 0 && epoch > 0 && epoch % config.checkpoint_every == 0 {
+        let val_loss = evaluate(&model, &val_batches, &causal_mask, dev)?;
+        match val_loss {
+            Some(l) => println!(
+                "\n Epoch {epoch}/{epochs}; Train Loss {epoch_loss:.6}; Val Loss {l:.6}; Took {:.3}",
+                epoch_timer.elapsed()
+            ),
+            None => println!(
+                "\n Epoch {epoch}/{epochs}; Train Loss {epoch_loss:.6}; Took {:.3}",
+                epoch_timer.elapsed()
+            ),
+        }
+
+        // every epoch by default - at half an hour each, losing one hurts
+        if config.checkpoint_every > 0 && epoch % config.checkpoint_every == 0 {
             if let Err(e) = var_map.save(&cpt_file) {
                 eprintln!("Error saving checkpoint: {e}");
+            }
+        }
+        // the last model is not the best one once validation loss turns back up
+        if let Some(l) = val_loss
+            && l < best_loss
+        {
+            best_loss = l;
+            if let Err(e) = var_map.save(&best_file) {
+                eprintln!("Error saving best model: {e}");
             }
         }
     }
@@ -500,7 +564,9 @@ fn sample(
 
 //best sampling performace is achieved when training window size is same as max context in sampling
 // now counted in tokens, not characters
-const WINDOW_SIZE: usize = 100;
+const WINDOW_SIZE: usize = 200;
+/// Fraction of the corpus held out to watch for memorisation
+const VALIDATION_SPLIT: f64 = 0.05;
 const CORPUS_FILE: &str = "data/capek.txt";
 
 fn main() -> anyhow::Result<()> {
@@ -520,18 +586,28 @@ fn main() -> anyhow::Result<()> {
                 ..Default::default()
             };
 
+            // held out as a contiguous tail, so no training window overlaps it
+            let tokens = corpus.tokens();
+            let split = tokens.len() - (tokens.len() as f64 * VALIDATION_SPLIT) as usize;
+            let (train_tokens, val_tokens) = tokens.split_at(split);
+            println!(
+                "Training on {} tokens, validating on {}",
+                train_tokens.len(),
+                val_tokens.len()
+            );
+
             let training_config = TrainingConfig {
                 epochs,
                 output_file: model,
                 model_cfg,
                 window_size: WINDOW_SIZE,
-                batch_size: 64,
+                batch_size: 32,
                 learning_rate: 0.001,
                 checkpoint,
-                checkpoint_every: 5,
+                checkpoint_every: 1,
             };
 
-            let _model = train(corpus.tokens(), training_config, &dev, &mut rng)?;
+            let _model = train(train_tokens, val_tokens, training_config, &dev, &mut rng)?;
         }
         Command::Sample {
             model,
