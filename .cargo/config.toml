@@ -1,0 +1,16 @@
+[build]
+# candle's elementwise ops (softmax, mask add, rope, layer norm, contiguous copies)
+# are plain single-threaded loops. Baseline x86-64 compiles them to SSE2; native
+# lets them autovectorise to AVX2. Only gemm does its own runtime dispatch.
+# Note: binaries built this way are not portable to a different CPU.
+rustflags = ["-C", "target-cpu=native"]
+
+# mimalloc otherwise returns freed blocks to the kernel, and since candle allocates
+# a fresh buffer for every op, each reuse faults the pages back in one 4K at a time.
+# Disabling purge cut minor page faults from 54.9M to 1.1M over 20 training batches.
+#
+# Cargo applies this to `cargo run` and `cargo test` only. If you run the binary
+# directly out of target/release, pass the variables yourself.
+[env]
+MIMALLOC_PURGE_DELAY = "-1"
+MIMALLOC_ALLOW_LARGE_OS_PAGES = "1"

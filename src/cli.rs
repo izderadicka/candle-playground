@@ -33,6 +33,11 @@ pub enum Command {
         epochs: usize,
         #[arg(short, long, help = "Saved model to start with")]
         checkpoint: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "stop each epoch after N batches, skipping validation and checkpoints - for benchmarking"
+        )]
+        max_batches: Option<usize>,
     },
     /// Sample text from a trained model
     Sample {

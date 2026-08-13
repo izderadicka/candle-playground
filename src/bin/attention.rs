@@ -13,6 +13,12 @@ use candle_playground::{
 use clap::Parser as _;
 use rand::RngExt;
 
+// Training allocates and frees gigabytes of transient tensors per step. mimalloc
+// keeps the freed blocks in userspace instead of handing them back to the kernel,
+// which is otherwise where most of the wall clock goes.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub struct SelfAttention {
     query: Linear,
     key: Linear,
@@ -336,6 +342,9 @@ struct TrainingConfig {
     learning_rate: f64,
     checkpoint: Option<PathBuf>,
     checkpoint_every: usize,
+    /// Benchmarking aid: stop each epoch after this many batches and skip
+    /// validation and checkpointing, so a timed run is the training loop alone.
+    max_batches: Option<usize>,
 }
 
 /// Contiguous windows from offset 0, no shuffling and no random start - the
@@ -397,13 +406,23 @@ fn train(
 
     // Tiled from offset 0 without shuffling, unlike the training batches, so the
     // validation loss is comparable across runs and not just across epochs.
-    let val_batches = validation_batches(validation, config.window_size, config.batch_size);
+    // benchmarking mode - the training loop and nothing around it
+    let benchmark = config.max_batches.is_some();
+    let val_batches = if benchmark {
+        Batches::new()
+    } else {
+        validation_batches(validation, config.window_size, config.batch_size)
+    };
     let mut best_loss = f32::INFINITY;
     println!("");
     for epoch in 0..epochs {
         let epoch_timer = Timer::new();
         let mut epoch_loss = 0.0;
         let batches = generate_batches(indices, config.window_size, config.batch_size, rng)?;
+        let batches = match config.max_batches {
+            Some(n) => &batches[..n.min(batches.len())],
+            None => &batches[..],
+        };
         let num_batches = batches.len();
         for (batch_idx, batch) in batches.iter().enumerate() {
             let (inputs, targets) = batch_data(&batch, dev)?;
@@ -431,7 +450,7 @@ fn train(
         }
 
         // every epoch by default - at half an hour each, losing one hurts
-        if config.checkpoint_every > 0 && epoch % config.checkpoint_every == 0 {
+        if !benchmark && config.checkpoint_every > 0 && epoch % config.checkpoint_every == 0 {
             if let Err(e) = var_map.save(&cpt_file) {
                 eprintln!("Error saving checkpoint: {e}");
             }
@@ -447,7 +466,7 @@ fn train(
         }
     }
 
-    if let Err(e) = var_map.save(config.output_file) {
+    if !benchmark && let Err(e) = var_map.save(config.output_file) {
         eprint!("Error saving model: {e}")
     }
 
@@ -579,6 +598,7 @@ fn main() -> anyhow::Result<()> {
             model,
             epochs,
             checkpoint,
+            max_batches,
         } => {
             let corpus = Corpus::from_files(&cli.tokenizer, CORPUS_FILE)?;
             let model_cfg = ModelConfig {
@@ -605,6 +625,7 @@ fn main() -> anyhow::Result<()> {
                 learning_rate: 0.001,
                 checkpoint,
                 checkpoint_every: 1,
+                max_batches,
             };
 
             let _model = train(train_tokens, val_tokens, training_config, &dev, &mut rng)?;
